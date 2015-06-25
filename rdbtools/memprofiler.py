@@ -77,11 +77,17 @@ class SummarizeDbInfo():
         self._db_stats[record.database]['size_in_bytes'] += record.bytes
         self._db_stats[record.database]['num_keys'] += 1
         self._db_stats[record.database]['types_count'][record.type] += 1
+        if self._db_stats[record.database]['num_keys'] % 100000 == 0:
+            self._out.write(self._get_stat_line(record.database))
 
     def dump_stats(self):
-        for db_num, stats in self._db_stats.items():
-            self._out.write("%d,%d,%d, %s\n" % (db_num, stats['size_in_bytes'], stats['num_keys'], [(type, count) for type, count in stats['types_count'].items()]) )
+        self._out.write("\n")
+        for db_num in self._db_stats:
+            self._out.write(self._get_stat_line(db_num))
 
+    def _get_stat_line(self, db_num):
+        stats = self._db_stats[db_num]
+        return ("%2d,%15d,%8d, %s\n" % (db_num, stats['size_in_bytes'], stats['num_keys'], [(type, count) for type, count in stats['types_count'].items()]) )
 
 class PrintAllKeys():
     def __init__(self, out):
