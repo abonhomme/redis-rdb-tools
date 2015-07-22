@@ -9,7 +9,7 @@ ZSKIPLIST_MAXLEVEL=32
 ZSKIPLIST_P=0.25
 REDIS_SHARED_INTEGERS = 10000
 
-MemoryRecord = namedtuple('MemoryRecord', ['database', 'type', 'key', 'bytes', 'encoding','size', 'len_largest_element'])
+MemoryRecord = namedtuple('MemoryRecord', ['database', 'type', 'key', 'bytes', 'encoding','size', 'len_largest_element', 'expiry', 'value'])
 
 class StatsAggregator():
     def __init__(self, key_groupings = None):
@@ -66,7 +66,7 @@ class StatsAggregator():
   
     def get_json(self):
         return json.dumps({"aggregates":self.aggregates, "scatters":self.scatters, "histograms":self.histograms})
-        
+
 class PrintAllKeys():
     def __init__(self, out):
         self._out = out
@@ -88,7 +88,9 @@ class MemoryCallback(RdbCallback):
         self._current_encoding = None
         self._current_length = 0
         self._len_largest_element = 0
-        
+        self._expiry = None
+        self._current_value = None
+
         if architecture == 64 or architecture == '64':
             self._pointer_size = 8
         elif architecture == 32 or architecture == '32':
@@ -104,7 +106,8 @@ class MemoryCallback(RdbCallback):
         pass
         
     def end_rdb(self):
-        pass
+        if hasattr(self._stream, 'end_rdb'):
+            self._stream.end_rdb()
        
     def set(self, key, value, expiry, info):
         self._current_encoding = info['encoding']
@@ -113,7 +116,7 @@ class MemoryCallback(RdbCallback):
         size += self.key_expiry_overhead(expiry)
         
         length = element_length(value)
-        record = MemoryRecord(self._dbnum, "string", key, size, self._current_encoding, length, length)
+        record = MemoryRecord(self._dbnum, "string", key, size, self._current_encoding, length, length, self._expiry, value)
         self._stream.next_record(record)
         self.end_key()
     
@@ -132,6 +135,8 @@ class MemoryCallback(RdbCallback):
         else:
             raise Exception('start_hash', 'Could not find encoding or sizeof_value in info object %s' % info)
         self._current_size = size
+        if self._current_value is None:
+            self._current_value = {}
     
     def hset(self, key, field, value):
         if(element_length(field) > self._len_largest_element) :
@@ -144,14 +149,16 @@ class MemoryCallback(RdbCallback):
             self._current_size += self.sizeof_string(value)
             self._current_size += self.hashtable_entry_overhead()
             self._current_size += 2*self.robj_overhead()
+        self._current_value[field] = value
     
     def end_hash(self, key):
-        record = MemoryRecord(self._dbnum, "hash", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element)
+        record = MemoryRecord(self._dbnum, "hash", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element, self._expiry, self._current_value)
         self._stream.next_record(record)
         self.end_key()
     
     def start_set(self, key, cardinality, expiry, info):
         # A set is exactly like a hashmap
+        self._current_value = set()
         self.start_hash(key, cardinality, expiry, info)
 
     def sadd(self, key, member):
@@ -162,9 +169,10 @@ class MemoryCallback(RdbCallback):
             self._current_size += self.sizeof_string(member)
             self._current_size += self.hashtable_entry_overhead()
             self._current_size += self.robj_overhead()
+        self._current_value.add(key)
     
     def end_set(self, key):
-        record = MemoryRecord(self._dbnum, "set", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element)
+        record = MemoryRecord(self._dbnum, "set", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element, self._expiry, self._current_value)
         self._stream.next_record(record)
         self.end_key()
     
@@ -183,6 +191,7 @@ class MemoryCallback(RdbCallback):
         else:
             raise Exception('start_list', 'Could not find encoding or sizeof_value in info object %s' % info)
         self._current_size = size
+        self._current_value = []
             
     def rpush(self, key, value) :
         if(element_length(value) > self._len_largest_element) :
@@ -192,9 +201,10 @@ class MemoryCallback(RdbCallback):
             self._current_size += self.sizeof_string(value)
             self._current_size += self.linkedlist_entry_overhead()
             self._current_size += self.robj_overhead()
+        self._current_value.append(value)
     
     def end_list(self, key):
-        record = MemoryRecord(self._dbnum, "list", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element)
+        record = MemoryRecord(self._dbnum, "list", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element, self._expiry, self._current_value)
         self._stream.next_record(record)
         self.end_key()
     
@@ -213,19 +223,22 @@ class MemoryCallback(RdbCallback):
         else:
             raise Exception('start_sorted_set', 'Could not find encoding or sizeof_value in info object %s' % info)
         self._current_size = size
+        self._current_value = []
     
     def zadd(self, key, score, member):
         if(element_length(member) > self._len_largest_element):
             self._len_largest_element = element_length(member)
-        
+
         if self._current_encoding == 'skiplist':
             self._current_size += 8 # self.sizeof_string(score)
             self._current_size += self.sizeof_string(member)
             self._current_size += 2*self.robj_overhead()
             self._current_size += self.skiplist_entry_overhead()
-    
+        self._current_value.append((member, score))
+
     def end_sorted_set(self, key):
-        record = MemoryRecord(self._dbnum, "sortedset", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element)
+        # self._current_value.sort(key=itemgetter(1))  # this is actually unnecessary b/c elements are added in sorted order
+        record = MemoryRecord(self._dbnum, "sortedset", key, self._current_size, self._current_encoding, self._current_length, self._len_largest_element, self._expiry, self._current_value)
         self._stream.next_record(record)
         self.end_key()
         
@@ -233,7 +246,9 @@ class MemoryCallback(RdbCallback):
         self._current_encoding = None
         self._current_size = 0
         self._len_largest_element = 0
-    
+        self._expiry = None
+        self._current_value = None
+
     def sizeof_string(self, string):
         # See struct sdshdr over here https://github.com/antirez/redis/blob/unstable/src/sds.h
         # int len :  4 bytes
@@ -260,7 +275,10 @@ class MemoryCallback(RdbCallback):
     def key_expiry_overhead(self, expiry):
         # If there is no expiry, there isn't any overhead
         if not expiry:
+            self._expiry = None
             return 0
+        else:
+            self._expiry = expiry
         # Key expiry is stored in a hashtable, so we have to pay for the cost of a hashtable entry
         # The timestamp itself is stored as an int64, which is a 8 bytes
         return self.hashtable_entry_overhead() + 8
